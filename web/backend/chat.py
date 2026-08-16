@@ -4,7 +4,8 @@ import json
 import re
 from typing import Any, Iterator
 
-from .foundation import BinanceMarketService, Store, decide
+from .foundation import BinanceMarketService, Store
+from .hybrid import HybridAnalysisService
 from .synthesis import DecisionSynthesizer, configured_synthesizer
 
 SYMBOL = re.compile(r"\b(?:[A-Z0-9]{2,20}(?:USDT|USDC)|BTC|ETH|SOL|XRP|BNB)\b", re.I)
@@ -36,7 +37,7 @@ def sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
 
 
-def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str, text: str, synthesizer: DecisionSynthesizer | None = None) -> Iterator[str]:
+def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str, text: str, synthesizer: DecisionSynthesizer | None = None, hybrid_service: HybridAnalysisService | None = None) -> Iterator[str]:
     conversation = store.conversation(conversation_id)
     if not conversation: raise KeyError("Conversation not found")
     intent, symbol = parse_intent(text, conversation.get("active_symbol"))
@@ -50,6 +51,19 @@ def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str
         yield from _complete(store, conversation_id, intent, "I can help with paper-only Binance USD-M Futures analysis. Ask for a long or short setup and include a symbol such as BTCUSDT."); return
     if not symbol:
         yield from _complete(store, conversation_id, intent, "Please provide a Binance USD-M Futures symbol, for example BTCUSDT."); return
+    service = hybrid_service or HybridAnalysisService(store)
+    if intent in {"why", "explain", "follow_up"}:
+        analysis = service.latest_reusable(conversation_id, symbol)
+        if analysis:
+            yield sse("analysis_state", {"analysis_id": analysis["id"], "fingerprint": analysis["fingerprint"], "cache": "reused", "expires_at": analysis.get("expires_at")})
+            yield sse("llm_result", analysis["llm_result"])
+            yield sse("validation_result", analysis["validation_result"])
+            decision = {**analysis["decision"], "validation_result": analysis["validation_result"], "cache": "reused", "synthesis_mode": analysis["synthesis_mode"], "analysis_id": analysis["id"]}
+            response = _reuse_response(intent, decision, analysis["verified_state"])
+            yield sse("partial_text", {"text": response})
+            yield sse("analysis_result", {"analysis_id": analysis["id"], "decision": decision, "analysis": analysis})
+            store.add_message(conversation_id, "assistant", response, {"intent": intent, "analysis_id": analysis["id"], "analysis": analysis})
+            yield sse("message_complete", {"conversation_id": conversation_id}); return
     yield sse("status", {"stage": "fetching_market_data", "symbol": symbol})
     try:
         snapshot = market.with_btc_context(symbol)
@@ -57,22 +71,26 @@ def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str
         quality = snapshot.get("quality", {})
         yield sse("market_data", {"symbol": snapshot["symbol"], "quality": quality, "health": snapshot.get("health", quality.get("health", {})), "price": snapshot.get("price"), "mark_price": snapshot.get("mark_price"), "index_price": snapshot.get("index_price")})
         yield sse("status", {"stage": "validating_market_data", "symbol": snapshot["symbol"]})
-        decision = decide(snapshot)
+        for timeframe in ("4h", "1h", "30m", "15m", "5m"):
+            yield sse("status", {"stage": f"loading_{timeframe}_structure", "symbol": snapshot["symbol"]})
+        yield sse("status", {"stage": "analyzing_market", "symbol": snapshot["symbol"]})
+        yield sse("status", {"stage": "assembling_verified_state", "symbol": snapshot["symbol"]})
+        analysis = service.analyze(snapshot, conversation_id)
+        yield sse("analysis_state", {"analysis_id": analysis["id"], "fingerprint": analysis["fingerprint"], "cache": analysis["cache"]})
+        yield sse("status", {"stage": "reasoning_with_llm", "symbol": snapshot["symbol"]})
+        yield sse("llm_result", analysis["llm_result"])
+        yield sse("status", {"stage": "validating_decision", "symbol": snapshot["symbol"]})
+        yield sse("validation_result", analysis["validation_result"])
+        decision = {**analysis["decision"], "validation_result": analysis["validation_result"], "cache": analysis["cache"], "synthesis_mode": analysis["synthesis_mode"]}
         if decision["decision_state"] == "DATA_UNAVAILABLE":
             yield sse("validation_failure", {"stage": "validation_failure", "blockers": decision.get("conflicts", []), "reason": decision["reason"]})
-        else:
-            for timeframe in ("4h", "1h", "30m", "15m", "5m"):
-                yield sse("status", {"stage": f"loading_{timeframe}_structure", "symbol": snapshot["symbol"]})
-            yield sse("status", {"stage": "analyzing_market", "symbol": snapshot["symbol"]})
+        decision["analysis_id"] = analysis["id"]
         decision = store.save_decision(decision, conversation_id)
         store.update_conversation(conversation_id, active_symbol=snapshot["symbol"])
         response = _response(decision)
-        if quality.get("valid") and quality.get("fresh"):
-            summary = (synthesizer or configured_synthesizer()).summarize(snapshot, decision)
-            if summary: response = f"{response}\n\nAdditional context: {summary}"
         yield sse("partial_text", {"text": response})
-        yield sse("analysis_result", {"decision": decision})
-        store.add_message(conversation_id, "assistant", response, {"intent": intent, "trade_id": decision["id"]})
+        yield sse("analysis_result", {"analysis_id": analysis["id"], "decision": decision})
+        store.add_message(conversation_id, "assistant", response, {"intent": intent, "trade_id": decision["id"], "analysis_id": analysis["id"], "analysis": analysis})
     except Exception as exc:
         response = "Analysis unavailable: live Binance market data could not be retrieved. No paper trade was created."
         decision = {"direction": "DATA_UNAVAILABLE", "entry_status": "UNAVAILABLE", "confidence": 0.0, "reason": str(exc)}
@@ -86,6 +104,12 @@ def _complete(store: Store, conversation_id: str, intent: str, response: str) ->
     yield sse("partial_text", {"text": response})
     store.add_message(conversation_id, "assistant", response, {"intent": intent})
     yield sse("message_complete", {"conversation_id": conversation_id})
+
+
+def _reuse_response(intent: str, decision: dict[str, Any], state: dict[str, Any]) -> str:
+    evidence = state.get("evidence", [])[:3]
+    support = "; ".join(str(item.get("detail", "validated evidence")) for item in evidence) or "No additional evidence was stored."
+    return f"Reused the latest validated analysis for {decision.get('symbol', 'this market')} without a new market request. {intent.replace('_', ' ').capitalize()}: {decision.get('reason', 'See the saved decision.')}. Evidence: {support}"
 
 
 def _history_response(store: Store, symbol: str | None) -> str:

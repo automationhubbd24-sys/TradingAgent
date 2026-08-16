@@ -522,7 +522,11 @@ class OutcomeService:
         if status == "OPEN":
             return {"trade_id": trade_id, "status": status, "evidence": evidence}, False
         outcome, created = self.store.upsert_outcome(trade_id, status, {**evidence, **({"reason": reason} if reason else {})})
-        if created and status in TERMINAL_OUTCOMES: self._postmortem(trade, outcome)
+        if created and status in TERMINAL_OUTCOMES:
+            self._postmortem(trade, outcome)
+            if trade.get("analysis_id"):
+                from .hybrid import HybridAnalysisService
+                HybridAnalysisService(self.store).record_learning(trade_id, outcome)
         return outcome, created
 
     def _postmortem(self, trade: dict[str, Any], outcome: dict[str, Any]) -> None:

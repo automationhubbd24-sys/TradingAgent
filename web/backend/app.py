@@ -10,12 +10,14 @@ from pydantic import BaseModel, Field, model_validator
 
 from .chat import stream_chat
 from .foundation import BinanceMarketService, BinanceWebSocketManager, OutcomeService, Store, TERMINAL_OUTCOMES
+from .hybrid import HybridAnalysisService, TradingBrainService
 from .jobs import create_run, get_run, list_runs
 from .schemas import AnalyzeRequest, CreateRunResponse, RunDetail, RunSummary
 
 FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 app = FastAPI(title="TradingAgents Web API", version="0.2.0")
 store, market, websocket_manager = Store(), BinanceMarketService(), BinanceWebSocketManager()
+hybrid_service = HybridAnalysisService(store)
 
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -56,7 +58,8 @@ def health() -> dict[str, Any]:
         database = "ok"
     except Exception as exc:  # pragma: no cover
         database = f"error: {exc}"
-    return {"status": "ok" if database == "ok" else "degraded", "database": database, "binance_rest": {"configured": True}, "binance_websocket": websocket_manager.status(), "workers": "not_configured", "llm": "not_required_for_chat", "execution": "paper_only"}
+    brain = TradingBrainService()
+    return {"status": "ok" if database == "ok" else "degraded", "database": database, "binance_rest": {"configured": True}, "binance_websocket": websocket_manager.status(), "workers": "not_configured", "llm": {"enabled": brain.enabled, "ready": brain.ready, "provider": brain.provider, "model": brain.model}, "execution": "paper_only"}
 
 
 @app.get("/api/options")
@@ -105,8 +108,22 @@ def messages(conversation_id: str) -> list[dict[str, Any]]:
 @app.post("/api/chat")
 def chat(request: ChatRequest) -> StreamingResponse:
     if not store.conversation(request.conversation_id): raise HTTPException(404, "Conversation not found")
-    return StreamingResponse(stream_chat(store, market, request.conversation_id, request.message), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(stream_chat(store, market, request.conversation_id, request.message, hybrid_service=hybrid_service), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+
+@app.get("/api/metrics")
+def metrics() -> dict[str, Any]: return hybrid_service.metrics
+@app.get("/api/analyses/{analysis_id}")
+def analysis_detail(analysis_id: str) -> dict[str, Any]:
+    result = store.analysis(analysis_id)
+    if not result: raise HTTPException(404, "Analysis not found")
+    return result
+@app.get("/api/conversations/{conversation_id}/latest-analysis")
+def latest_analysis(conversation_id: str) -> dict[str, Any]:
+    if not store.conversation(conversation_id): raise HTTPException(404, "Conversation not found")
+    result = store.latest_analysis(conversation_id)
+    if not result: raise HTTPException(404, "No analysis found")
+    return result
 
 @app.get("/api/market/{symbol}")
 def market_snapshot(symbol: str) -> dict[str, Any]:
