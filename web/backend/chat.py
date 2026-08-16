@@ -104,11 +104,11 @@ def _performance_response(store: Store) -> str:
 
 def _response(decision: dict[str, Any]) -> str:
     if decision["decision_state"] == "DATA_UNAVAILABLE": return f"Decision: DATA_UNAVAILABLE. {decision['reason']}"
-    if decision["entry_status"] == "NO_TRADE": return f"Decision: NO_TRADE. {decision['reason']}"
+    if decision["decision_state"] == "NO_TRADE": return f"Decision: NO_TRADE. {decision['reason']}"
     if decision["entry_status"] != "CONFIRMED":
         zone = decision.get("setup_zone", {})
-        return f"Directional bias: {decision['directional_bias']}. Readiness: {decision['entry_status']}. Zone {zone.get('low'):.8g}-{zone.get('high'):.8g}. {decision['reason']}"
-    return (f"Paper-only confirmed plan: {decision['directional_bias']} {decision['symbol']}. "
+        return f"Decision: {decision['decision_state']}. Directional bias: {decision['directional_bias']}. Readiness: {decision['entry_status']}. Zone {zone.get('low', 0):.8g}-{zone.get('high', 0):.8g}. {decision['reason']}"
+    return (f"Paper-only confirmed plan ({decision['decision_state']}): {decision['directional_bias']} {decision['symbol']}. "
             f"Entry {decision['entry']:.8g}, stop {decision['stop_loss']:.8g}, "
             f"targets {decision['take_profits'][0]:.8g} (2R) / {decision['take_profits'][1]:.8g} (3R). "
             f"{decision['reason']}")

@@ -532,3 +532,7 @@ class OutcomeService:
             conn.execute("INSERT INTO post_mortems VALUES (?,?,?) ON CONFLICT(trade_id) DO NOTHING", (trade["id"], json.dumps(payload), now_iso()))
         lesson = self.store.save_learning("lessons", {"trade_id": trade["id"], "category": primary, "condition": trade["market_regime"], "lesson": "Observe repeated evidence before proposing a candidate rule.", "evidence_count": 1})
         self.store.save_learning("patterns", {"trade_id": trade["id"], "description": f"{trade['direction']} in {trade['market_regime']}", "outcome": outcome["status"], "lesson_id": lesson["id"]})
+
+
+# Keep the established foundation import surface while delegating analysis to v3.
+from .market_intelligence.decision import decide, derive_structure  # noqa: E402
