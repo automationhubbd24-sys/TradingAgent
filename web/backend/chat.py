@@ -58,10 +58,11 @@ def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str
         yield sse("market_data", {"symbol": snapshot["symbol"], "quality": quality, "health": snapshot.get("health", quality.get("health", {})), "price": snapshot.get("price"), "mark_price": snapshot.get("mark_price"), "index_price": snapshot.get("index_price")})
         yield sse("status", {"stage": "validating_market_data", "symbol": snapshot["symbol"]})
         decision = decide(snapshot)
-        if decision["direction"] == "DATA_UNAVAILABLE":
+        if decision["decision_state"] == "DATA_UNAVAILABLE":
             yield sse("validation_failure", {"stage": "validation_failure", "blockers": decision.get("conflicts", []), "reason": decision["reason"]})
         else:
-            yield sse("status", {"stage": "loading_4h_structure", "symbol": snapshot["symbol"]})
+            for timeframe in ("4h", "1h", "30m", "15m", "5m"):
+                yield sse("status", {"stage": f"loading_{timeframe}_structure", "symbol": snapshot["symbol"]})
             yield sse("status", {"stage": "analyzing_market", "symbol": snapshot["symbol"]})
         decision = store.save_decision(decision, conversation_id)
         store.update_conversation(conversation_id, active_symbol=snapshot["symbol"])
@@ -102,9 +103,12 @@ def _performance_response(store: Store) -> str:
 
 
 def _response(decision: dict[str, Any]) -> str:
-    if decision["direction"] == "DATA_UNAVAILABLE": return f"Decision: DATA_UNAVAILABLE. {decision['reason']}"
-    if decision["direction"] == "NO_TRADE": return f"Decision: NO_TRADE. {decision['reason']}"
-    return (f"Paper-only decision: {decision['direction']} {decision['symbol']}. "
+    if decision["decision_state"] == "DATA_UNAVAILABLE": return f"Decision: DATA_UNAVAILABLE. {decision['reason']}"
+    if decision["entry_status"] == "NO_TRADE": return f"Decision: NO_TRADE. {decision['reason']}"
+    if decision["entry_status"] != "CONFIRMED":
+        zone = decision.get("setup_zone", {})
+        return f"Directional bias: {decision['directional_bias']}. Readiness: {decision['entry_status']}. Zone {zone.get('low'):.8g}-{zone.get('high'):.8g}. {decision['reason']}"
+    return (f"Paper-only confirmed plan: {decision['directional_bias']} {decision['symbol']}. "
             f"Entry {decision['entry']:.8g}, stop {decision['stop_loss']:.8g}, "
-            f"TP1 {decision['take_profits'][0]:.8g}, expected RR {decision['expected_rr']:.1f}. "
+            f"targets {decision['take_profits'][0]:.8g} (2R) / {decision['take_profits'][1]:.8g} (3R). "
             f"{decision['reason']}")

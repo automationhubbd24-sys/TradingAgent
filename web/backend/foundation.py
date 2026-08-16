@@ -373,48 +373,121 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError): return None
 
 
+def atr(candles: list[dict[str, Any]], period: int = 14) -> float | None:
+    """Wilder-style true-range average over closed OHLCV candles."""
+    if len(candles) < 2:
+        return None
+    ranges = []
+    previous_close = float(candles[0]["close"])
+    for candle in candles[1:]:
+        high, low = float(candle["high"]), float(candle["low"])
+        ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+        previous_close = float(candle["close"])
+    values = ranges[-period:]
+    return sum(values) / len(values) if values else None
+
+
+def confirmed_swing_pivots(candles: list[dict[str, Any]], width: int = 2) -> dict[str, list[dict[str, Any]]]:
+    """Return pivots only after `width` subsequent closed candles confirm them."""
+    highs, lows = [], []
+    for index in range(width, len(candles) - width):
+        candle = candles[index]
+        window = candles[index - width:index + width + 1]
+        if float(candle["high"]) == max(float(item["high"]) for item in window): highs.append({"index": index, "price": float(candle["high"])})
+        if float(candle["low"]) == min(float(item["low"]) for item in window): lows.append({"index": index, "price": float(candle["low"])})
+    return {"highs": highs, "lows": lows}
+
+
+def classify_swings(pivots: dict[str, list[dict[str, Any]]]) -> str:
+    highs, lows = pivots["highs"], pivots["lows"]
+    if len(highs) < 2 or len(lows) < 2: return "MIXED"
+    high_state = "HH" if highs[-1]["price"] > highs[-2]["price"] else "LH"
+    low_state = "HL" if lows[-1]["price"] > lows[-2]["price"] else "LL"
+    return f"{high_state}_{low_state}" if (high_state, low_state) in {("HH", "HL"), ("LH", "LL")} else "MIXED"
+
+
+def displacement(candles: list[dict[str, Any]], atr_value: float | None) -> dict[str, Any]:
+    if not candles or not atr_value: return {"present": False, "direction": "NEUTRAL"}
+    candle = candles[-1]
+    body = abs(float(candle["close"]) - float(candle["open"]))
+    average_volume = sum(float(item.get("volume", 0)) for item in candles[-20:]) / min(20, len(candles))
+    direction = "LONG" if float(candle["close"]) > float(candle["open"]) else "SHORT"
+    return {"present": body >= atr_value * 0.3 and float(candle.get("volume", 0)) >= average_volume, "direction": direction, "body": body, "volume": float(candle.get("volume", 0)), "average_volume": average_volume}
+
+
+def closed_break(candles: list[dict[str, Any]], direction: str, atr_value: float | None) -> str | None:
+    if len(candles) < 6 or not atr_value: return None
+    close = float(candles[-1]["close"])
+    reference = max(float(item["close"]) for item in candles[-6:-1]) if direction == "LONG" else min(float(item["close"]) for item in candles[-6:-1])
+    crossed = close > reference + atr_value * 0.1 if direction == "LONG" else close < reference - atr_value * 0.1
+    if not crossed: return None
+    prior = float(candles[-2]["close"])
+    reversal = prior <= reference if direction == "LONG" else prior >= reference
+    return "CHOCH_LIKE" if reversal else "BOS"
+
+
+def timeframe_assessment(candles: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(candles) < 6: return {"bias": "neutral", "structure": "INSUFFICIENT", "pivots": {"highs": [], "lows": []}, "atr": None, "bos": None, "displacement": {"present": False, "direction": "NEUTRAL"}}
+    value = atr(candles)
+    pivots = confirmed_swing_pivots(candles)
+    structure = classify_swings(pivots)
+    first, last = float(candles[-min(20, len(candles))]["close"]), float(candles[-1]["close"])
+    bias = "bullish" if structure == "HH_HL" or (structure == "MIXED" and last > first) else "bearish" if structure == "LH_LL" or (structure == "MIXED" and last < first) else "neutral"
+    direction = "LONG" if bias == "bullish" else "SHORT" if bias == "bearish" else "NEUTRAL"
+    return {"bias": bias, "structure": structure, "pivots": pivots, "atr": value, "bos": closed_break(candles, direction, value) if direction != "NEUTRAL" else None, "displacement": displacement(candles, value), "last_close": last, "swing_high": max(float(item["high"]) for item in candles[-8:]), "swing_low": min(float(item["low"]) for item in candles[-8:])}
+
+
 def derive_structure(candles: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
-    output: dict[str, Any] = {}
-    for timeframe, rows in candles.items():
-        if len(rows) < 3:
-            output[timeframe] = {"bias": "unknown", "structure": "INSUFFICIENT"}
-            continue
-        closes = [float(row["close"]) for row in rows[-20:]]
-        highs = [float(row["high"]) for row in rows[-20:]]
-        lows = [float(row["low"]) for row in rows[-20:]]
-        higher = closes[-1] > closes[0] and highs[-1] >= max(highs[-5:])
-        lower = closes[-1] < closes[0] and lows[-1] <= min(lows[-5:])
-        bias = "bullish" if higher else "bearish" if lower else "neutral"
-        output[timeframe] = {"bias": bias, "structure": "HH_HL" if higher else "LH_LL" if lower else "RANGE", "last_close": closes[-1], "swing_high": max(highs[-8:]), "swing_low": min(lows[-8:])}
-    return output
+    return {timeframe: timeframe_assessment(rows) for timeframe, rows in candles.items()}
+
+
+def setup_zone(candles: list[dict[str, Any]], direction: str, assessment: dict[str, Any]) -> dict[str, float | str]:
+    for candle in reversed(candles[:-1]):
+        opposing = float(candle["close"]) < float(candle["open"]) if direction == "LONG" else float(candle["close"]) > float(candle["open"])
+        if opposing:
+            return {"low": float(candle["low"]), "high": float(candle["high"]), "source": "last_opposing_candle"}
+    low, high = assessment["swing_low"], assessment["swing_high"]
+    spread = high - low
+    return {"low": low + spread * 0.382, "high": low + spread * 0.618, "source": "retracement_fallback"}
+
+
+def _confidence(snapshot: dict[str, Any], aligned: int) -> float:
+    modifier = 0.0
+    for value in (snapshot.get("order_book", {}).get("imbalance"), snapshot.get("order_flow", {}).get("imbalance")):
+        if isinstance(value, (int, float)): modifier += max(-0.025, min(0.025, value * 0.025))
+    funding = snapshot.get("funding", {}).get("rate")
+    ratio = snapshot.get("positioning", {}).get("long_short_ratio")
+    if isinstance(funding, (int, float)): modifier -= max(-0.02, min(0.02, funding * 20))
+    if isinstance(ratio, (int, float)): modifier += max(-0.02, min(0.02, (ratio - 1) * 0.02))
+    return round(max(0.0, min(0.9, 0.45 + aligned * 0.1 + modifier)), 2)
 
 
 def decide(snapshot: dict[str, Any]) -> dict[str, Any]:
-    structure = derive_structure(snapshot.get("candles", {}))
-    quality = snapshot.get("quality", {})
-    base = {"id": uuid.uuid4().hex, "symbol": snapshot.get("symbol", "UNKNOWN"), "execution_mode": "PAPER_ONLY", "strategy_version": "foundation-1.0", "market_regime": "UNKNOWN", "structure": structure, "created_at": now_iso()}
-    critical_missing = quality.get("critical_missing", [])
-    critical_stale = quality.get("critical_stale", [])
-    # Legacy quality payloads have only missing/stale and remain safely supported.
-    invalid_critical = critical_missing + critical_stale or ((not quality.get("valid") or not quality.get("fresh")) and (quality.get("missing", []) + quality.get("stale", [])))
-    if invalid_critical or snapshot.get("price") is None:
+    structure, quality = derive_structure(snapshot.get("candles", {})), snapshot.get("quality", {})
+    base = {"id": uuid.uuid4().hex, "symbol": snapshot.get("symbol", "UNKNOWN"), "execution_mode": "PAPER_ONLY", "strategy_version": "decision-engine-2.0", "decision_state": "READY", "market_regime": "UNKNOWN", "structure": structure, "created_at": now_iso(), "limitations": ["OHLCV-led, closed-candle-only heuristic; not liquidation intelligence or full institutional SMC.", "Paper-only analysis; no external order execution."]}
+    critical_missing, critical_stale = quality.get("critical_missing", []), quality.get("critical_stale", [])
+    invalid = critical_missing + critical_stale or ((not quality.get("valid") or not quality.get("fresh")) and (quality.get("missing", []) + quality.get("stale", [])))
+    if invalid or snapshot.get("price") is None:
         blockers = critical_missing + critical_stale or quality.get("missing", []) + quality.get("stale", [])
-        return {**base, "direction": "DATA_UNAVAILABLE", "entry_status": "UNAVAILABLE", "confidence": 0.0, "reason": "Analysis unavailable: critical live market data is missing or stale.", "conflicts": blockers, "data_diagnostic": {"critical_missing": critical_missing, "critical_stale": critical_stale, "blockers": blockers}}
-    htf = [structure[t]["bias"] for t in ("4h", "1h")]
-    ltf = [structure[t]["bias"] for t in ("15m", "5m")]
-    conflict = len(set(htf + ltf) - {"neutral"}) > 1
-    if conflict or "neutral" in htf:
-        return {**base, "direction": "NO_TRADE", "entry_status": "WAIT", "confidence": 0.35, "reason": "Timeframe evidence conflicts; waiting for alignment.", "conflicts": [f"HTF={htf}", f"LTF={ltf}"], "market_regime": "REVERSAL_RISK"}
-    direction = "LONG" if htf[0] == "bullish" and all(value == "bullish" for value in ltf) else "SHORT" if htf[0] == "bearish" and all(value == "bearish" for value in ltf) else "NO_TRADE"
-    if direction == "NO_TRADE":
-        return {**base, "direction": direction, "entry_status": "WAIT", "confidence": 0.4, "reason": "No confirmed lower-timeframe continuation.", "conflicts": [f"HTF={htf}", f"LTF={ltf}"], "market_regime": "RANGING"}
-    price, execution = float(snapshot["price"]), structure["15m"]
-    stop = execution["swing_low"] if direction == "LONG" else execution["swing_high"]
+        return {**base, "decision_state": "DATA_UNAVAILABLE", "direction": "DATA_UNAVAILABLE", "directional_bias": "NEUTRAL", "entry_status": "UNAVAILABLE", "confidence": 0.0, "reason": "Analysis unavailable: critical live market data is missing or stale.", "conflicts": blockers, "data_diagnostic": {"critical_missing": critical_missing, "critical_stale": critical_stale, "blockers": blockers}}
+    macro, confirmation = structure.get("4h", {}), structure.get("1h", {})
+    if macro.get("bias") not in {"bullish", "bearish"} or macro.get("bias") != confirmation.get("bias"):
+        return {**base, "direction": "NO_TRADE", "directional_bias": "NEUTRAL", "entry_status": "NO_TRADE", "confidence": _confidence(snapshot, 0), "reason": "4h macro bias and 1h confirmation are not aligned.", "conflicts": [f"4h={macro.get('bias')}", f"1h={confirmation.get('bias')}"]}
+    direction = "LONG" if macro["bias"] == "bullish" else "SHORT"
+    zone = setup_zone(snapshot["candles"]["30m"], direction, structure["30m"])
+    base = {**base, "direction": direction, "directional_bias": direction, "setup_zone": zone, "confidence": _confidence(snapshot, 2), "market_regime": "TRENDING_UP" if direction == "LONG" else "TRENDING_DOWN"}
+    fifteen, five = structure["15m"], structure["5m"]
+    if fifteen.get("bias") != macro["bias"]:
+        return {**base, "entry_status": "WAIT_FOR_PULLBACK", "reason": "Directional bias is intact; wait for a 15m pullback and stabilization in the 30m setup zone.", "conflicts": [f"15m={fifteen.get('bias')}"]}
+    if five.get("bias") != macro["bias"] or not five.get("bos"):
+        return {**base, "entry_status": "WAIT_FOR_5M_CONFIRMATION", "reason": "Directional bias is intact; wait for a closed 5m breakout/BOS confirmation.", "conflicts": [f"5m={five.get('bias')}", f"5m_break={five.get('bos')}"]}
+    price = float(snapshot["price"])
+    stop = fifteen["swing_low"] if direction == "LONG" else fifteen["swing_high"]
     risk = abs(price - stop)
     if risk <= 0 or risk / price > 0.1:
-        return {**base, "direction": "NO_TRADE", "entry_status": "NO_TRADE", "confidence": 0.0, "reason": "Structure-derived stop is invalid.", "conflicts": []}
-    tp1 = price + 2 * risk if direction == "LONG" else price - 2 * risk
-    return {**base, "direction": direction, "entry_status": "CONFIRMED", "confidence": 0.65, "reason": "Multi-timeframe structure is aligned; paper decision only.", "conflicts": [], "entry": price, "stop_loss": stop, "take_profits": [tp1], "invalidation": stop, "expected_rr": 2.0, "market_regime": "TRENDING_UP" if direction == "LONG" else "TRENDING_DOWN"}
+        return {**base, "direction": "NO_TRADE", "directional_bias": "NEUTRAL", "entry_status": "NO_TRADE", "reason": "Structure-derived stop is invalid.", "conflicts": []}
+    targets = [price + risk * multiple if direction == "LONG" else price - risk * multiple for multiple in (2, 3)]
+    return {**base, "entry_status": "CONFIRMED", "reason": "4h/1h structure, 30m zone, 15m stabilization, and a closed 5m breakout align; paper plan only.", "conflicts": [], "entry": price, "stop_loss": stop, "take_profits": targets, "invalidation": stop, "expected_rr": 2.0}
 
 
 class OutcomeService:

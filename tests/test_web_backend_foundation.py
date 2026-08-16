@@ -26,10 +26,32 @@ def test_structure_and_quality_no_trade():
     assert decide({**snapshot(), "quality": {"valid": True, "fresh": False, "missing": [], "stale": ["candles.5m"]}})["direction"] == "DATA_UNAVAILABLE"
 
 
-def test_decision_conflict_and_paper_long():
-    conflicting = snapshot(); conflicting["candles"]["5m"] = candles("down")["5m"]
-    assert decide(conflicting)["direction"] == "NO_TRADE"
-    assert decide(snapshot())["direction"] == "LONG"
+def test_decision_engine_v2_readiness_and_confirmed_plan():
+    pullback = snapshot(); pullback["candles"]["15m"] = candles("down")["15m"]
+    pullback_decision = decide(pullback)
+    assert pullback_decision["strategy_version"] == "decision-engine-2.0"
+    assert pullback_decision["decision_state"] == "READY"
+    assert pullback_decision["directional_bias"] == "LONG"
+    assert pullback_decision["entry_status"] == "WAIT_FOR_PULLBACK"
+    assert "entry" not in pullback_decision
+
+    confirmation = snapshot(); confirmation["candles"]["5m"] = candles("down")["5m"]
+    confirmation_decision = decide(confirmation)
+    assert confirmation_decision["directional_bias"] == "LONG"
+    assert confirmation_decision["entry_status"] == "WAIT_FOR_5M_CONFIRMATION"
+    assert "entry" not in confirmation_decision
+
+    confirmed = decide(snapshot())
+    assert confirmed["direction"] == "LONG" and confirmed["entry_status"] == "CONFIRMED"
+    assert len(confirmed["take_profits"]) == 2 and confirmed["expected_rr"] == 2.0
+
+
+def test_no_trade_is_distinct_from_data_unavailable():
+    no_trade = snapshot(); no_trade["candles"]["1h"] = candles("down")["1h"]
+    decision = decide(no_trade)
+    assert decision["decision_state"] == "READY" and decision["entry_status"] == "NO_TRADE"
+    unavailable = decide({"symbol": "BTCUSDT", "price": None, "candles": {}, "quality": {"valid": False, "fresh": False, "missing": ["price"]}})
+    assert unavailable["decision_state"] == "DATA_UNAVAILABLE" and unavailable["entry_status"] == "UNAVAILABLE"
 
 
 @pytest.mark.parametrize("direction", ["up", "down"])
@@ -122,7 +144,7 @@ def test_chat_sse_success_and_degraded_analysis(tmp_path, monkeypatch):
         def with_btc_context(self, symbol): return snapshot()
     monkeypatch.setattr(app_module, "market", GoodMarket())
     success = client.post("/api/chat", json={"conversation_id": created["id"], "message": "analyse BTCUSDT"})
-    assert "fetching_market_data" in success.text and "validating_market_data" in success.text and "analyzing_market" in success.text
+    assert all(stage in success.text for stage in ("fetching_market_data", "validating_market_data", "loading_4h_structure", "loading_1h_structure", "loading_30m_structure", "loading_15m_structure", "loading_5m_structure", "analyzing_market"))
     class BadMarket:
         def with_btc_context(self, symbol): raise RuntimeError("offline")
     monkeypatch.setattr(app_module, "market", BadMarket())

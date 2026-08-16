@@ -143,7 +143,7 @@ def strategies() -> list[dict[str, Any]]: return store.list_learning("strategy_v
 @app.get("/api/performance")
 def performance() -> dict[str, Any]:
     decisions = store.trades()
-    actionable = [decision for decision in decisions if decision["direction"] != "NO_TRADE"]
+    actionable = [decision for decision in decisions if decision.get("entry_status") == "CONFIRMED"]
     statuses = [store.outcome(decision["id"])["status"] if store.outcome(decision["id"]) else "OPEN" for decision in actionable]
     return {"decisions": len(decisions), "paper_positions": len(actionable), "open": statuses.count("OPEN"), "unresolved": statuses.count("UNRESOLVED"), "terminal": sum(status in TERMINAL_OUTCOMES for status in statuses), "execution": "disabled", "strategy_promotion": "disabled"}
 
