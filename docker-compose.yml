@@ -1,36 +1,48 @@
 services:
-  tradingagents:
-    build: .
-    env_file:
-      - .env
-    volumes:
-      - tradingagents_data:/home/appuser/.tradingagents
-    tty: true
-    stdin_open: true
-
-  ollama:
-    image: ollama/ollama:latest
-    volumes:
-      - ollama_data:/root/.ollama
-    profiles:
-      - ollama
-
-  tradingagents-ollama:
-    build: .
-    env_file:
-      - .env
+  postgres:
+    image: postgres:16-alpine
     environment:
-      - TRADINGAGENTS_LLM_PROVIDER=ollama
-      - OLLAMA_BASE_URL=http://ollama:11434/v1
+      POSTGRES_DB: tradingagents
+      POSTGRES_USER: tradingagents
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tradingagents -d tradingagents"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     volumes:
-      - tradingagents_data:/home/appuser/.tradingagents
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql://tradingagents:${POSTGRES_PASSWORD:-change-me}@postgres:5432/tradingagents
+    command: ["sh", "-c", "alembic upgrade head && uvicorn web.backend.app:app --host 0.0.0.0 --port 8000"]
+    ports: ["8000:8000"]
     depends_on:
-      - ollama
-    tty: true
-    stdin_open: true
-    profiles:
-      - ollama
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: .
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql://tradingagents:${POSTGRES_PASSWORD:-change-me}@postgres:5432/tradingagents
+    command: ["sh", "-c", "alembic upgrade head && echo 'worker readiness: no queue configured' && tail -f /dev/null"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  scheduler:
+    build: .
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql://tradingagents:${POSTGRES_PASSWORD:-change-me}@postgres:5432/tradingagents
+    command: ["sh", "-c", "alembic upgrade head && echo 'scheduler readiness: no schedule configured' && tail -f /dev/null"]
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
-  tradingagents_data:
-  ollama_data:
+  postgres_data:

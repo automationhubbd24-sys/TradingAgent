@@ -19,6 +19,8 @@ COPY pyproject.toml README.md ./
 COPY tradingagents ./tradingagents
 COPY cli ./cli
 COPY web/backend ./web/backend
+COPY alembic.ini ./
+COPY alembic ./alembic
 RUN pip install --no-cache-dir .
 
 FROM python:3.12-slim

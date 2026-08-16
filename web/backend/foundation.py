@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import requests
+from sqlalchemy import create_engine, text
 
 from tradingagents.dataflows.binance import normalize_binance_symbol
 
@@ -27,34 +28,52 @@ def now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def database_url(url: str | None = None) -> str:
+    value = url or os.getenv("DATABASE_URL") or os.getenv("TRADINGAGENTS_DATABASE_URL", "sqlite:///./.tradingagents/tradingagents.db")
+    # SQLAlchemy uses postgresql+psycopg; accept the conventional deployment URL.
+    return value.replace("postgres://", "postgresql+psycopg://", 1).replace("postgresql://", "postgresql+psycopg://", 1)
+
+
 def database_path(url: str | None = None) -> str:
-    value = url or os.getenv("TRADINGAGENTS_DATABASE_URL", "sqlite:///./.tradingagents/tradingagents.db")
-    if value.startswith("sqlite:///"):
-        path = value[10:]
-    elif value.startswith("sqlite://"):
-        path = value[9:]
-    elif "://" in value:
-        raise ValueError("Only sqlite database URLs are supported by this backend foundation")
-    else:
-        path = value
+    value = database_url(url)
+    if not value.startswith("sqlite:"):
+        raise ValueError("database_path is only available for sqlite URLs")
+    path = value[10:] if value.startswith("sqlite:///") else value[9:]
     if path != ":memory:":
         Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
+class _PostgresConnection:
+    """Minimal DB-API-shaped adapter for the existing repository queries."""
+    def __init__(self, engine: Any): self.engine, self.connection, self.context = engine, None, None
+    def __enter__(self): self.context = self.engine.begin(); self.connection = self.context.__enter__(); return self
+    def __exit__(self, *args: Any): return self.context.__exit__(*args)
+    def execute(self, statement: str, parameters: Any = None) -> Any:
+        if isinstance(parameters, dict):
+            return self.connection.execute(text(statement), parameters)
+        # Existing repository SQL uses qmark bindings; psycopg uses %s.
+        return self.connection.exec_driver_sql(statement.replace("?", "%s"), parameters or ())
+
+
 class Store:
-    """Small sqlite repository; JSON payloads preserve evolving market evidence."""
+    """Repository with SQLite development support and PostgreSQL-ready URL validation."""
 
     def __init__(self, url: str | None = None):
-        self.path = database_path(url)
+        self.url = database_url(url)
+        self.is_sqlite = self.url.startswith("sqlite:")
+        self.engine = create_engine(self.url, future=True) if not self.is_sqlite else None
+        self.path = database_path(self.url) if self.is_sqlite else None
         self._lock = threading.RLock()
         self.initialize()
 
-    def _connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+    def _connection(self) -> Any:
+        if self.is_sqlite:
+            connection = sqlite3.connect(self.path, check_same_thread=False)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            return connection
+        return _PostgresConnection(self.engine)
 
     def initialize(self) -> None:
         tables = {
@@ -78,10 +97,10 @@ class Store:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_decisions_created ON trade_decisions(created_at)")
 
     @staticmethod
-    def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    def _row(row: Any | None) -> dict[str, Any] | None:
         if row is None:
             return None
-        result = dict(row)
+        result = dict(getattr(row, "_mapping", row))
         for key in list(result):
             if key.endswith("_json"):
                 result[key[:-5]] = json.loads(result.pop(key))
@@ -369,6 +388,6 @@ class OutcomeService:
         primary = "VALID_SETUP_NORMAL_LOSS" if outcome["status"] == "SL_HIT" else "UNKNOWN"
         payload = {"trade_id": trade["id"], "outcome": outcome["status"], "primary_error": primary, "summary": f"Paper trade closed as {outcome['status']}; strategy was not modified.", "created_at": now_iso()}
         with self.store._lock, self.store._connection() as conn:
-            conn.execute("INSERT OR IGNORE INTO post_mortems VALUES (?,?,?)", (trade["id"], json.dumps(payload), now_iso()))
+            conn.execute("INSERT INTO post_mortems VALUES (?,?,?) ON CONFLICT(trade_id) DO NOTHING", (trade["id"], json.dumps(payload), now_iso()))
         lesson = self.store.save_learning("lessons", {"trade_id": trade["id"], "category": primary, "condition": trade["market_regime"], "lesson": "Observe repeated evidence before proposing a candidate rule.", "evidence_count": 1})
         self.store.save_learning("patterns", {"trade_id": trade["id"], "description": f"{trade['direction']} in {trade['market_regime']}", "outcome": outcome["status"], "lesson_id": lesson["id"]})

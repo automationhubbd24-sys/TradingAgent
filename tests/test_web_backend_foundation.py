@@ -4,7 +4,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from web.backend import app as app_module
-from web.backend.foundation import BinanceMarketService, OutcomeService, Store, decide, derive_structure
+from web.backend.chat import parse_intent
+from web.backend.foundation import BinanceMarketService, OutcomeService, Store, database_url, decide, derive_structure
 
 
 def candles(direction: str):
