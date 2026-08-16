@@ -12,6 +12,9 @@ from typing import Any, Callable
 
 from tradingagents.llm_clients.factory import create_llm_client
 from .foundation import Store, decide
+from .market_intelligence.advanced_smc import analyze_snapshot as analyze_smc_snapshot
+from .market_intelligence.flow import analyze as analyze_flow
+from .market_intelligence.historical_context import HistoricalProfileBuilder
 
 FINAL_STATES = {"LONG_READY", "LONG_WAIT", "SHORT_READY", "SHORT_WAIT", "NO_TRADE", "DATA_UNAVAILABLE"}
 
@@ -31,8 +34,8 @@ def _number(value: Any) -> float | None:
         return None
 
 
-def verified_market_state(snapshot: dict[str, Any], deterministic: dict[str, Any], max_evidence: int = 40) -> dict[str, Any]:
-    """Create a compact, JSON-safe state from existing v3 output only."""
+def verified_market_state(snapshot: dict[str, Any], deterministic: dict[str, Any], smc: dict[str, Any] | None = None, liquidity_flow: dict[str, Any] | None = None, historical_context: dict[str, Any] | None = None, max_evidence: int = 40) -> dict[str, Any]:
+    """Create a compact, JSON-safe state from deterministic market sensors only."""
     evidence: list[dict[str, Any]] = []
     freshness = snapshot.get("quality", {})
     for tf, item in deterministic.get("structure", {}).items():
@@ -40,11 +43,21 @@ def verified_market_state(snapshot: dict[str, Any], deterministic: dict[str, Any
         evidence.append({"kind": "structure", "direction": str(item.get("bias", "neutral")).upper(), "detail": detail, "timeframe": tf, "strength": 0.7, "source": "binance_klines", "engine": "decision_engine_v3", "timestamp": snapshot.get("source_timestamps", {}).get(f"candles.{tf}"), "limitations": ["closed-OHLCV proxy"]})
     for item in deterministic.get("supporting_evidence", []) + deterministic.get("contradicting_evidence", []):
         evidence.append({**item, "source": "decision_engine_v3", "engine": "decision_engine_v3", "timestamp": snapshot.get("timestamp"), "limitations": ["deterministic proxy evidence"]})
+    for timeframe, item in (smc or {}).items():
+        for kind in ("bos", "choch", "displacement", "breakout"):
+            value = item.get(kind)
+            if value and value != {"state": "NONE", "basis": "OHLCV_PROXY"}:
+                evidence.append({"kind": kind, "detail": f"{timeframe} {kind}: {value}", "timeframe": timeframe, "source": "smc_engine", "engine": "smc_engine", "timestamp": snapshot.get("source_timestamps", {}).get(f"candles.{timeframe}"), "limitations": ["closed-OHLCV proxy"]})
+    for kind, value in (liquidity_flow or {}).items():
+        if isinstance(value, dict) and value.get("status") != "UNAVAILABLE":
+            evidence.append({"kind": kind, "detail": f"{kind}: {value.get('state', 'AVAILABLE')}", "source": "liquidity_flow_engine", "engine": "liquidity_flow_engine", "timestamp": snapshot.get("timestamp"), "limitations": ["current snapshot or bounded stream evidence"]})
+    if historical_context and historical_context.get("status") not in {"UNAVAILABLE", "PARTIAL", "BUILDING"}:
+        evidence.append({"kind": "historical_context", "detail": f"Historical profile: {historical_context.get('market_regime', 'AVAILABLE')}", "source": "historical_context_engine", "engine": "historical_context_engine", "timestamp": historical_context.get("as_of"), "limitations": historical_context.get("limitations", [])})
     normalized = []
     for item in evidence[:max(1, min(max_evidence, 100))]:
         stable = _json({key: item.get(key) for key in ("kind", "direction", "detail", "timeframe", "source", "engine", "timestamp")})
         normalized.append({"id": f"ev_{hashlib.sha256(stable.encode()).hexdigest()[:16]}", **item})
-    state = {"version": "verified-market-state-1", "symbol": snapshot.get("symbol"), "current_price": _number(snapshot.get("price")), "mark_price": _number(snapshot.get("mark_price")), "data_freshness": {"valid": freshness.get("valid", False), "fresh": freshness.get("fresh", False), "missing": freshness.get("missing", []), "stale": freshness.get("stale", [])}, "timeframes": {tf: {key: value for key, value in item.items() if key in {"bias", "structure", "bos", "choch", "last_close", "swing_high", "swing_low", "atr"}} for tf, item in deterministic.get("structure", {}).items()}, "futures_context": deterministic.get("futures_context", {}), "btc_context": deterministic.get("btc_context", {}), "risk_context": {key: deterministic.get(key) for key in ("entry", "stop_loss", "take_profits", "expected_rr", "setup_zone")}, "limitations": list(dict.fromkeys(deterministic.get("limitations", []) + ["Evidence is bounded and derived from the current v3 snapshot."])), "evidence": normalized}
+    state = {"version": "verified-market-state-2", "symbol": snapshot.get("symbol"), "current_price": _number(snapshot.get("price")), "mark_price": _number(snapshot.get("mark_price")), "data_freshness": {"valid": freshness.get("valid", False), "fresh": freshness.get("fresh", False), "missing": freshness.get("missing", []), "stale": freshness.get("stale", [])}, "timeframes": {tf: {key: value for key, value in item.items() if key in {"bias", "structure", "bos", "choch", "last_close", "swing_high", "swing_low", "atr"}} for tf, item in deterministic.get("structure", {}).items()}, "smc": smc or {}, "liquidity_flow": liquidity_flow or {}, "historical_context": historical_context or {"status": "PARTIAL"}, "futures_context": deterministic.get("futures_context", {}), "btc_context": deterministic.get("btc_context", {}), "risk_context": {key: deterministic.get(key) for key in ("entry", "stop_loss", "take_profits", "expected_rr", "setup_zone")}, "limitations": list(dict.fromkeys(deterministic.get("limitations", []) + (historical_context or {}).get("limitations", []) + ["Evidence is bounded; historical context is compact and no raw history is passed to the LLM."])), "evidence": normalized}
     state["fingerprint"] = hashlib.sha256(_json({key: value for key, value in state.items() if key != "fingerprint"}).encode()).hexdigest()
     return state
 
@@ -145,8 +158,9 @@ _install_store_methods()
 
 
 class HybridAnalysisService:
-    def __init__(self, store: Store, brain: TradingBrainService | None = None, cache_ttl_seconds: int | None = None):
+    def __init__(self, store: Store, brain: TradingBrainService | None = None, cache_ttl_seconds: int | None = None, historical_builder: HistoricalProfileBuilder | None = None):
         self.store, self.brain, self.validator = store, brain or TradingBrainService(), DecisionValidator(); self.store.initialize_hybrid()
+        self.historical_builder = historical_builder or HistoricalProfileBuilder()
         self.cache_ttl_seconds = max(1, cache_ttl_seconds if cache_ttl_seconds is not None else int(os.getenv("TRADINGAGENTS_ANALYSIS_CACHE_TTL_SECONDS", "300")))
         self.metrics = {"llm_calls": 0, "correction_calls": 0, "analysis_cache_hits": 0, "analysis_cache_misses": 0, "market_requests": 0, "analysis_reuses": 0}
     @staticmethod
@@ -160,7 +174,12 @@ class HybridAnalysisService:
             return {**result, "cache": "reused"}
         return None
     def analyze(self, snapshot: dict[str, Any], conversation_id: str | None = None) -> dict[str, Any]:
-        self.metrics["market_requests"] += 1; deterministic = decide(snapshot); state = verified_market_state(snapshot, deterministic)
+        self.metrics["market_requests"] += 1
+        deterministic = decide(snapshot)
+        smc = analyze_smc_snapshot(snapshot)
+        liquidity_flow = analyze_flow(snapshot)
+        historical_context = self.historical_builder.profile(snapshot)
+        state = verified_market_state(snapshot, deterministic, smc, liquidity_flow, historical_context)
         with self.store._connection() as conn: cached = conn.execute("SELECT analysis_id, expires_at FROM analysis_cache_entries WHERE fingerprint=?", (state["fingerprint"],)).fetchone()
         if cached and self._valid_until(cached[1]):
             result = self.store.analysis(cached[0])

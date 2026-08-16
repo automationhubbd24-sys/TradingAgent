@@ -18,6 +18,8 @@ from sqlalchemy import create_engine, text
 
 from tradingagents.dataflows.binance import normalize_binance_symbol
 
+from .streaming import BinanceFuturesStream, MarketEvent, OrderBook
+
 UTC = timezone.utc
 FUTURES_URL = "https://fapi.binance.com"
 TIMEFRAMES = ("4h", "1h", "30m", "15m", "5m")

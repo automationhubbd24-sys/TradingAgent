@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,14 +13,28 @@ from .chat import stream_chat
 from .foundation import BinanceMarketService, BinanceWebSocketManager, OutcomeService, Store, TERMINAL_OUTCOMES
 from .hybrid import HybridAnalysisService, TradingBrainService
 from .jobs import create_run, get_run, list_runs
+from .streaming import BinanceFuturesStream
 from .schemas import AnalyzeRequest, CreateRunResponse, RunDetail, RunSummary
 
 FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 app = FastAPI(title="TradingAgents Web API", version="0.2.0")
 store, market, websocket_manager = Store(), BinanceMarketService(), BinanceWebSocketManager()
+stream_symbols = tuple(symbol.strip().upper() for symbol in os.getenv("TRADINGAGENTS_STREAM_SYMBOLS", "HEMIUSDT,BTCUSDT").split(",") if symbol.strip())
+market_stream = BinanceFuturesStream(stream_symbols, snapshot_fetcher=lambda symbol: market._get("/fapi/v1/depth", {"symbol": symbol, "limit": 100}))
 hybrid_service = HybridAnalysisService(store)
 
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+def start_market_stream() -> None:
+    market_stream.start()
+
+
+@app.on_event("shutdown")
+def stop_market_stream() -> None:
+    market_stream.shutdown()
+    hybrid_service.historical_builder.shutdown()
 
 
 class ConversationCreate(BaseModel):
@@ -59,7 +74,8 @@ def health() -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover
         database = f"error: {exc}"
     brain = TradingBrainService()
-    return {"status": "ok" if database == "ok" else "degraded", "database": database, "binance_rest": {"configured": True}, "binance_websocket": websocket_manager.status(), "workers": "not_configured", "llm": {"enabled": brain.enabled, "ready": brain.ready, "provider": brain.provider, "model": brain.model}, "execution": "paper_only"}
+    stream_status = market_stream.status()
+    return {"status": "ok" if database == "ok" else "degraded", "database": database, "binance_rest": {"configured": True}, "binance_websocket": stream_status, "market_state": {"symbols": list(stream_symbols), "live": stream_status["connected"] and not stream_status["stale"]}, "smc_engine": "ready", "liquidity_flow_engine": "ready", "historical_profile": "background_partial_fallback", "llm_provider": {"enabled": brain.enabled, "ready": brain.ready, "provider": brain.provider, "model": brain.model}, "validator": "ready", "workers": "in_process_background", "execution": "paper_only"}
 
 
 @app.get("/api/options")
@@ -107,8 +123,13 @@ def messages(conversation_id: str) -> list[dict[str, Any]]:
     return store.messages(conversation_id)
 @app.post("/api/chat")
 def chat(request: ChatRequest) -> StreamingResponse:
-    if not store.conversation(request.conversation_id): raise HTTPException(404, "Conversation not found")
-    return StreamingResponse(stream_chat(store, market, request.conversation_id, request.message, hybrid_service=hybrid_service), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    if not store.conversation(request.conversation_id):
+        raise HTTPException(404, "Conversation not found")
+    return StreamingResponse(
+        stream_chat(store, market, request.conversation_id, request.message, hybrid_service=hybrid_service, market_stream=market_stream),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/metrics")

@@ -21,8 +21,22 @@ const stageLabels: Record<string, string> = {
   loading_15m_structure: 'Loading 15m market structure',
   loading_5m_structure: 'Loading 5m market structure',
   analyzing_market: 'Analyzing market structure',
+  analyzing_smc: 'Analyzing SMC structure',
+  analyzing_liquidity: 'Analyzing liquidity',
+  analyzing_futures_flow: 'Analyzing futures flow',
+  loading_historical_context: 'Loading historical context',
+  assembling_verified_state: 'Assembling verified market state',
+  reasoning_with_llm: 'Reasoning over market state',
+  validating_decision: 'Validating paper decision',
   validation_failure: 'Market data validation failed',
 };
+
+async function chatResponseError(response: Response) {
+  const body = (await response.text()).trim();
+  if (!body) return `Chat service returned HTTP ${response.status}.`;
+  try { const parsed = JSON.parse(body) as { detail?: string }; return parsed.detail || `Chat service returned HTTP ${response.status}.`; }
+  catch { return `${response.status} ${response.statusText}: ${body.slice(0, 240)}`; }
+}
 
 function App() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -58,11 +72,14 @@ function App() {
     try {
       const id = conversationId || await createConversation(); const controller = new AbortController(); aborter.current = controller;
       const response = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' }, body: JSON.stringify({ conversation_id: id, message: question }), signal: controller.signal });
-      if (!response.ok || !response.body) throw new Error('Chat service did not return a stream.');
+      if (!response.ok) throw new Error(await chatResponseError(response));
+      if (!response.body) throw new Error('The chat connection opened without a response stream. Please retry after the deployment is healthy.');
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('text/event-stream')) throw new Error(await chatResponseError(response));
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
       while (true) { const { value, done } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true }); const blocks = buffer.split('\n\n'); buffer = blocks.pop() || ''; blocks.forEach(block => consumeEvent(block, assistantId)); }
       setMessages(items => items.map(item => item.id === assistantId ? { ...item, streaming: false, content: item.content || 'No response was returned.' } : item)); await loadConversations();
-    } catch (err) { if ((err as Error).name !== 'AbortError') { setError(err instanceof Error ? err.message : 'Unable to reach chat service.'); setMessages(items => items.map(item => item.id === assistantId ? { ...item, streaming: false, content: 'Unable to complete this request.' } : item)); } }
+    } catch (err) { if ((err as Error).name !== 'AbortError') { const message = err instanceof Error ? err.message : 'Unable to reach chat service.'; setError(message); setMessages(items => items.map(item => item.id === assistantId ? { ...item, streaming: false, content: `Unable to complete this request. ${message}` } : item)); } }
     finally { setStreaming(false); aborter.current = null; }
   }
   function consumeEvent(block: string, assistantId: string) {

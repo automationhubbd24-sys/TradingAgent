@@ -1,8 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import urllib.request
 from typing import Any, Iterator
+
+
+# #region debug-point chat-stream-failure
+
+def _debug_stream_event(hypothesis_id: str, message: str, data: dict[str, Any]) -> None:
+    url = os.getenv("DEBUG_SERVER_URL")
+    if not url:
+        return
+    payload = {"sessionId": os.getenv("DEBUG_SESSION_ID", "chat-stream-failure"), "runId": "pre-fix", "hypothesisId": hypothesis_id, "location": "web/backend/chat.py", "msg": f"[DEBUG] {message}", "data": data}
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}), timeout=0.2).read()
+    except Exception:
+        pass
+
+# #endregion
 
 from .foundation import BinanceMarketService, Store
 from .hybrid import HybridAnalysisService
@@ -37,11 +54,22 @@ def sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
 
 
-def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str, text: str, synthesizer: DecisionSynthesizer | None = None, hybrid_service: HybridAnalysisService | None = None) -> Iterator[str]:
+def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str, text: str, synthesizer: DecisionSynthesizer | None = None, hybrid_service: HybridAnalysisService | None = None, market_stream: Any | None = None) -> Iterator[str]:
+    # #region debug-point A:generator-entry
+    _debug_stream_event("A", "chat generator entered", {"conversation_id": conversation_id, "message_length": len(text)})
+    # #endregion
     conversation = store.conversation(conversation_id)
-    if not conversation: raise KeyError("Conversation not found")
+    if not conversation:
+        # #region debug-point A:conversation-missing
+        _debug_stream_event("A", "conversation missing in generator", {"conversation_id": conversation_id})
+        # #endregion
+        raise KeyError("Conversation not found")
     intent, symbol = parse_intent(text, conversation.get("active_symbol"))
     store.add_message(conversation_id, "user", text, {"intent": intent})
+    # #region debug-point A:first-frame
+    _debug_stream_event("A", "first SSE frame emitted", {"conversation_id": conversation_id, "intent": intent, "symbol": symbol})
+    # #endregion
+    yield ": stream-open\n\n"
     yield sse("message_start", {"conversation_id": conversation_id, "intent": intent})
     if intent == "history":
         yield from _complete(store, conversation_id, intent, _history_response(store, symbol)); return
@@ -67,6 +95,12 @@ def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str
     yield sse("status", {"stage": "fetching_market_data", "symbol": symbol})
     try:
         snapshot = market.with_btc_context(symbol)
+        if market_stream:
+            live_state = market_stream.state(snapshot["symbol"])
+            if live_state.get("stream", {}).get("connected") and not live_state["stream"].get("stale"):
+                snapshot = {**snapshot, "agg_trades": live_state.get("agg_trades", []), "liquidations": live_state.get("force_orders", []), "order_book": live_state.get("order_book", snapshot.get("order_book", {})), "stream_state": live_state["stream"]}
+            else:
+                snapshot["stream_state"] = live_state.get("stream", {})
         store.save_snapshot(snapshot)
         quality = snapshot.get("quality", {})
         yield sse("market_data", {"symbol": snapshot["symbol"], "quality": quality, "health": snapshot.get("health", quality.get("health", {})), "price": snapshot.get("price"), "mark_price": snapshot.get("mark_price"), "index_price": snapshot.get("index_price")})
@@ -74,8 +108,18 @@ def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str
         for timeframe in ("4h", "1h", "30m", "15m", "5m"):
             yield sse("status", {"stage": f"loading_{timeframe}_structure", "symbol": snapshot["symbol"]})
         yield sse("status", {"stage": "analyzing_market", "symbol": snapshot["symbol"]})
+        yield sse("status", {"stage": "analyzing_smc", "symbol": snapshot["symbol"]})
+        yield sse("status", {"stage": "analyzing_liquidity", "symbol": snapshot["symbol"]})
+        yield sse("status", {"stage": "analyzing_futures_flow", "symbol": snapshot["symbol"]})
+        yield sse("status", {"stage": "loading_historical_context", "symbol": snapshot["symbol"]})
         yield sse("status", {"stage": "assembling_verified_state", "symbol": snapshot["symbol"]})
+        # #region debug-point B:hybrid-start
+        _debug_stream_event("B", "hybrid analysis starting", {"conversation_id": conversation_id, "symbol": snapshot["symbol"]})
+        # #endregion
         analysis = service.analyze(snapshot, conversation_id)
+        # #region debug-point B:hybrid-complete
+        _debug_stream_event("B", "hybrid analysis completed", {"analysis_id": analysis.get("id"), "cache": analysis.get("cache"), "mode": analysis.get("synthesis_mode")})
+        # #endregion
         yield sse("analysis_state", {"analysis_id": analysis["id"], "fingerprint": analysis["fingerprint"], "cache": analysis["cache"]})
         yield sse("status", {"stage": "reasoning_with_llm", "symbol": snapshot["symbol"]})
         yield sse("llm_result", analysis["llm_result"])
@@ -92,6 +136,9 @@ def stream_chat(store: Store, market: BinanceMarketService, conversation_id: str
         yield sse("analysis_result", {"analysis_id": analysis["id"], "decision": decision})
         store.add_message(conversation_id, "assistant", response, {"intent": intent, "trade_id": decision["id"], "analysis_id": analysis["id"], "analysis": analysis})
     except Exception as exc:
+        # #region debug-point B:analysis-error
+        _debug_stream_event("B", "chat analysis failed after first frame", {"exception_type": type(exc).__name__, "error": str(exc), "conversation_id": conversation_id, "symbol": symbol})
+        # #endregion
         response = "Analysis unavailable: live Binance market data could not be retrieved. No paper trade was created."
         decision = {"direction": "DATA_UNAVAILABLE", "entry_status": "UNAVAILABLE", "confidence": 0.0, "reason": str(exc)}
         yield sse("validation_failure", {"stage": "validation_failure", "blockers": ["market_data"], "reason": str(exc)})
